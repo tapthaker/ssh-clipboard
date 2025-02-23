@@ -1,23 +1,104 @@
 use arboard::Clipboard;
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead};
+use std::env;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+const SOCKET_PATH: &str = "/tmp/iosync_socket";
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 struct Message {
     content: String,
 }
 
-fn main() {
-    // Shared state for the most recent clipboard message to avoid ping-pong.
-    let last_message = Arc::new(Mutex::new(Message {
-        content: String::new(),
-    }));
+/// Helper: remove old socket if it exists.
+fn cleanup_socket() {
+    if Path::new(SOCKET_PATH).exists() {
+        let _ = std::fs::remove_file(SOCKET_PATH);
+    }
+}
 
-    // Thread that reads from stdin.
-    let last_message_clone = Arc::clone(&last_message);
+fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> {
+    cleanup_socket();
+    let listener = UnixListener::bind(SOCKET_PATH)?;
+
+    // Server loop: accept connections on the Unix socket.
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                let last_message_conn = Arc::clone(&last_message);
+                thread::spawn(move || {
+                    // Read the command from the client.
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut command = String::new();
+                    if let Err(e) = reader.read_line(&mut command) {
+                        eprintln!("Failed to read from stream: {}", e);
+                        return;
+                    }
+                    command = command.trim().to_string();
+
+                    // Command protocol:
+                    // "GET" returns the current clipboard content.
+                    // "SET <text>" updates the clipboard.
+                    if command == "GET" {
+                        let last = last_message_conn.lock().unwrap();
+                        let reply = last.clone();
+                        let _ = stream.write_all(reply.as_bytes());
+                    } else if command.starts_with("SET ") {
+                        let new_text = command["SET ".len()..].to_string();
+                        let msg = Message {
+                            content: new_text.clone(),
+                        };
+                        let mut last = last_message_conn.lock().unwrap();
+                        if *last != msg.content {
+                            if let Ok(msg_str) = serde_json::to_string(&msg) {
+                                *last = msg.content.clone();
+                                eprintln!("CLIPBOARD-SYNC:{}", msg_str)
+                            }
+                        }
+                        let _ = stream.write_all(b"OK");
+                    } else {
+                        let _ = stream.write_all(b"Unknown command");
+                    }
+                    let _ = stream.shutdown(Shutdown::Both);
+                });
+            }
+            Err(e) => {
+                eprintln!("Socket connection failed: {}", e);
+            }
+        }
+    }
+    return Ok(());
+}
+
+fn run_iosync_mode_on_mac(last_message: Arc<Mutex<String>>) -> io::Result<()> {
+    // Thread that monitors the clipboard changes.
+    let last_message_for_clipboard = Arc::clone(&last_message);
+    let clipboard_thread = thread::spawn(move || {
+        let mut clipboard = Clipboard::new().expect("Failed to open clipboard");
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            if let Ok(text) = clipboard.get_text() {
+                let mut last = last_message_for_clipboard.lock().unwrap();
+                if *last != text {
+                    let msg = Message {
+                        content: text.clone(),
+                    };
+                    if let Ok(msg_str) = serde_json::to_string(&msg) {
+                        *last = text;
+                        eprintln!("CLIPBOARD-SYNC:{}", msg_str);
+                    }
+                }
+            }
+        }
+    });
+
+    let last_message_for_stdin = Arc::clone(&last_message);
     let stdin_thread = thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
@@ -25,50 +106,85 @@ fn main() {
                 // Check if the line starts with "CLIPBOARD_SYNC:".
                 if line.starts_with("CLIPBOARD_SYNC:") {
                     // Extract the message after the command.
-                    let msg_content = line["CLIPBOARD_SYNC:".len()..].trim().to_string();
-                    let msg = Message {
-                        content: msg_content,
-                    };
-                    // Serialize the message to a JSON string.
-                    let json_msg = serde_json::to_string(&msg)
-                        .expect("Failed to serialize message to JSON");
-                    let mut last = last_message_clone.lock().unwrap();
-                    if *last != msg {
-                        *last = msg;
-                        let mut clipboard =
-                            Clipboard::new().expect("Failed to open clipboard");
-                        clipboard
-                            .set_text(json_msg)
-                            .expect("Failed to set clipboard text");
+                    let msg_str = line["CLIPBOARD_SYNC:".len()..].trim().to_string();
+                    if let Ok(msg) = serde_json::from_str::<Message>(&msg_str) {
+                        let mut last = last_message_for_stdin.lock().unwrap();
+                        if *last != msg.content {
+                            *last = msg.content.clone();
+                            let mut clipboard = Clipboard::new().expect("Failed to open clipboard");
+                            let _ = clipboard.set_text(msg.content);
+                        }
                     }
                 } else {
-                    // If the line doesn't match, print it to standard output.
                     println!("{}", line);
                 }
             }
         }
     });
 
-    // Thread to monitor the clipboard and send new messages to stderr.
-    let last_message_clone2 = Arc::clone(&last_message);
-    let clipboard_thread = thread::spawn(move || {
-        let mut clipboard = Clipboard::new().expect("Failed to open clipboard");
-        loop {
-            thread::sleep(Duration::from_millis(200)); // avoid busy looping
-            if let Ok(text) = clipboard.get_text() {
-                // Attempt to deserialize the JSON string into a Message.
-                if let Ok(parsed_msg) = serde_json::from_str::<Message>(&text) {
-                    let mut last = last_message_clone2.lock().unwrap();
-                    if *last != parsed_msg {
-                        *last = parsed_msg.clone();
-                        // Print only the message content to stderr.
-                        eprintln!("{}", parsed_msg.content);
-                    }
-                }
-            }
-        }
-    });
+    clipboard_thread.join().expect("Clipboard thread panicked");
+    stdin_thread.join().expect("Stdin thread panicked");
 
-    stdin_thread.join().unwrap();
-    clipboard_thread.join().unwrap();
+    return Ok(());
+}
+
+/// The iosync mode: run a server on a Unix domain socket and monitor the clipboard.
+fn run_iosync_mode() -> io::Result<()> {
+    // Shared state for the most recent clipboard message.
+    let last_message = Arc::new(Mutex::new(String::new()));
+    if cfg!(target_os = "linux") {
+        // Listen on the Unix domain socket if we are running inside
+        // a Linux box
+        // The assumption is that you are sshing into a Linux box that doesn't have a GUI
+        // Thus we are using the xclip mode to notify this server of clipboard changes
+        return run_iosync_mode_on_linux(last_message);
+    } else {
+        // Listen to macOS clipboard changes
+        return run_iosync_mode_on_mac(last_message);
+    }
+}
+
+/// The xclip mode: act as a client that either reads (with "-o") or writes to the socket.
+fn run_xclip_mode() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    // Connect to the Unix domain socket.
+    let mut stream = UnixStream::connect(SOCKET_PATH)
+        .expect("Failed to connect to the iosync socket; is the iosync process running?");
+    if args.len() > 1 && args[1] == "-o" {
+        // Read mode: send "GET" and print the reply.
+        stream.write_all(b"GET\n")?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+        println!("{}", reply);
+    } else {
+        // Write mode: read from stdin, then send "SET <input>".
+        let stdin = io::stdin();
+        let input: String = stdin
+            .lock()
+            .lines()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cmd = format!("SET {}", input);
+        stream.write_all(cmd.as_bytes())?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+    }
+    Ok(())
+}
+
+fn main() {
+    // Decide mode based on the executable name.
+    let exe_name = env::args().next().unwrap_or_default();
+    if exe_name.ends_with("xclip") {
+        if let Err(err) = run_xclip_mode() {
+            eprintln!("Error in xclip mode: {}", err);
+            std::process::exit(1);
+        }
+    } else {
+        if let Err(err) = run_iosync_mode() {
+            eprintln!("Error in iosync mode: {}", err);
+            std::process::exit(1);
+        }
+    }
 }
