@@ -48,7 +48,7 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
         match stream {
             Ok(mut stream) => {
                 let last_message_conn = Arc::clone(&last_message);
-                thread::spawn(move || {
+                let unix_socket_reader_thread = thread::spawn(move || {
                     // Read the command from the client.
                     let mut reader = BufReader::new(&mut stream);
                     let mut command = String::new();
@@ -57,6 +57,7 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
                         return;
                     }
                     command = command.trim().to_string();
+                    log!("Received command: {}", command);
 
                     // Command protocol:
                     // "GET" returns the current clipboard content.
@@ -83,6 +84,7 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
                     }
                     let _ = stream.shutdown(Shutdown::Both);
                 });
+                unix_socket_reader_thread.join().expect("Unix socket reader thread panicked");
             }
             Err(e) => {
                 log!("Socket connection failed: {}", e);
