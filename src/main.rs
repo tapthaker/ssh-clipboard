@@ -10,6 +10,21 @@ use std::thread;
 use std::time::Duration;
 
 const SOCKET_PATH: &str = "/tmp/iosync_socket";
+const LOG_PATH: &str = "/tmp/ssh-clipboard.log";
+
+//Write a macro to log to a file
+macro_rules! log {
+    ($($arg:tt)*) => {
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(LOG_PATH)
+                .expect("Failed to open log file");
+            writeln!(file, $($arg)*).expect("Failed to write to log file");
+        }
+    };
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 struct Message {
@@ -26,6 +41,7 @@ fn cleanup_socket() {
 fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> {
     cleanup_socket();
     let listener = UnixListener::bind(SOCKET_PATH)?;
+    log!("Listening on the Unix socket: {}", SOCKET_PATH);
 
     // Server loop: accept connections on the Unix socket.
     for stream in listener.incoming() {
@@ -37,7 +53,7 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
                     let mut reader = BufReader::new(&mut stream);
                     let mut command = String::new();
                     if let Err(e) = reader.read_line(&mut command) {
-                        eprintln!("Failed to read from stream: {}", e);
+                        log!("Failed to read from stream: {}", e);
                         return;
                     }
                     command = command.trim().to_string();
@@ -69,7 +85,7 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
                 });
             }
             Err(e) => {
-                eprintln!("Socket connection failed: {}", e);
+                log!("Socket connection failed: {}", e);
             }
         }
     }
@@ -86,6 +102,7 @@ fn run_iosync_mode_on_mac(last_message: Arc<Mutex<String>>) -> io::Result<()> {
             if let Ok(text) = clipboard.get_text() {
                 let mut last = last_message_for_clipboard.lock().unwrap();
                 if *last != text {
+                    log!("Clipboard changed: {}", text);
                     let msg = Message {
                         content: text.clone(),
                     };
@@ -110,6 +127,7 @@ fn run_iosync_mode_on_mac(last_message: Arc<Mutex<String>>) -> io::Result<()> {
                     if let Ok(msg) = serde_json::from_str::<Message>(&msg_str) {
                         let mut last = last_message_for_stdin.lock().unwrap();
                         if *last != msg.content {
+                            log!("Setting clipboard to: {}", msg.content);
                             *last = msg.content.clone();
                             let mut clipboard = Clipboard::new().expect("Failed to open clipboard");
                             let _ = clipboard.set_text(msg.content);
@@ -148,42 +166,50 @@ fn run_iosync_mode() -> io::Result<()> {
 fn run_xclip_mode() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     // Connect to the Unix domain socket.
-    let mut stream = UnixStream::connect(SOCKET_PATH)
-        .expect("Failed to connect to the iosync socket; is the iosync process running?");
-    if args.len() > 1 && args[1] == "-o" {
-        // Read mode: send "GET" and print the reply.
-        stream.write_all(b"GET\n")?;
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply)?;
-        println!("{}", reply);
-    } else {
-        // Write mode: read from stdin, then send "SET <input>".
-        let stdin = io::stdin();
-        let input: String = stdin
-            .lock()
-            .lines()
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let cmd = format!("SET {}", input);
-        stream.write_all(cmd.as_bytes())?;
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply)?;
+    match UnixStream::connect(SOCKET_PATH) {
+        Ok(mut stream) => {
+            if args.len() > 1 && args[1] == "-o" {
+                // Read mode: send "GET" and print the reply.
+                stream.write_all(b"GET\n")?;
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply)?;
+                println!("{}", reply);
+            } else {
+                // Write mode: read from stdin, then send "SET <input>".
+                let stdin = io::stdin();
+                let input: String = stdin
+                    .lock()
+                    .lines()
+                    .filter_map(Result::ok)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let cmd = format!("SET {}", input);
+                stream.write_all(cmd.as_bytes())?;
+                let mut reply = String::new();
+                stream.read_to_string(&mut reply)?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            log!("Failed to connect to the iosync socket: {}", e);
+            return Err(e);
+        }
     }
-    Ok(())
 }
 
 fn main() {
     // Decide mode based on the executable name.
     let exe_name = env::args().next().unwrap_or_default();
     if exe_name.ends_with("xclip") {
+        log!("Running in xclip mode");
         if let Err(err) = run_xclip_mode() {
-            eprintln!("Error in xclip mode: {}", err);
+            log!("Error in xclip mode: {}", err);
             std::process::exit(1);
         }
     } else {
+        log!("Running in iosync mode");
         if let Err(err) = run_iosync_mode() {
-            eprintln!("Error in iosync mode: {}", err);
+            log!("Error in iosync mode: {}", err);
             std::process::exit(1);
         }
     }
