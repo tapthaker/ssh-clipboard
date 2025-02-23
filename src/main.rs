@@ -48,43 +48,40 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
         match stream {
             Ok(mut stream) => {
                 let last_message_conn = Arc::clone(&last_message);
-                let unix_socket_reader_thread = thread::spawn(move || {
-                    // Read the command from the client.
-                    let mut reader = BufReader::new(&mut stream);
-                    let mut command = String::new();
-                    if let Err(e) = reader.read_line(&mut command) {
-                        log!("Failed to read from stream: {}", e);
-                        return;
-                    }
-                    command = command.trim().to_string();
-                    log!("Received command: {}", command);
+                // Read the command from the client.
+                let mut reader = BufReader::new(&mut stream);
+                let mut command = String::new();
+                if let Err(e) = reader.read_line(&mut command) {
+                    log!("Failed to read from stream: {}", e);
+                }
+                command = command.trim().to_string();
+                log!("Received command: {}", command);
 
-                    // Command protocol:
-                    // "GET" returns the current clipboard content.
-                    // "SET <text>" updates the clipboard.
-                    if command == "GET" {
-                        let last = last_message_conn.lock().unwrap();
-                        let reply = last.clone();
-                        let _ = stream.write_all(reply.as_bytes());
-                    } else if command.starts_with("SET ") {
-                        let new_text = command["SET ".len()..].to_string();
-                        let msg = Message {
-                            content: new_text.clone(),
-                        };
-                        let mut last = last_message_conn.lock().unwrap();
-                        if *last != msg.content {
-                            if let Ok(msg_str) = serde_json::to_string(&msg) {
-                                *last = msg.content.clone();
-                                eprintln!("CLIPBOARD-SYNC:{}", msg_str)
-                            }
+                // Command protocol:
+                // "GET" returns the current clipboard content.
+                // "SET <text>" updates the clipboard.
+                if command == "GET" {
+                    let last = last_message_conn.lock().unwrap();
+                    let reply = last.clone();
+                    let _ = stream.write_all(reply.as_bytes());
+                } else if command.starts_with("SET ") {
+                    let new_text = command["SET ".len()..].to_string();
+                    let msg = Message {
+                        content: new_text.clone(),
+                    };
+                    let mut last = last_message_conn.lock().unwrap();
+                    if *last != msg.content {
+                        if let Ok(msg_str) = serde_json::to_string(&msg) {
+                            *last = msg.content.clone();
+                            eprintln!("CLIPBOARD-SYNC:{}", msg_str);
+                            log!("CLIPBOARD-SYNC:{}", msg_str);
                         }
-                        let _ = stream.write_all(b"OK");
-                    } else {
-                        let _ = stream.write_all(b"Unknown command");
                     }
-                    let _ = stream.shutdown(Shutdown::Both);
-                });
-                unix_socket_reader_thread.join().expect("Unix socket reader thread panicked");
+                    let _ = stream.write_all(b"OK");
+                } else {
+                    let _ = stream.write_all(b"Unknown command");
+                }
+                let _ = stream.shutdown(Shutdown::Both);
             }
             Err(e) => {
                 log!("Socket connection failed: {}", e);
@@ -95,24 +92,33 @@ fn run_iosync_mode_on_linux(last_message: Arc<Mutex<String>>) -> io::Result<()> 
 }
 
 fn run_iosync_mode_on_mac(last_message: Arc<Mutex<String>>) -> io::Result<()> {
+
+    log!("Running on macOS");
     // Thread that monitors the clipboard changes.
     let last_message_for_clipboard = Arc::clone(&last_message);
     let clipboard_thread = thread::spawn(move || {
-        let mut clipboard = Clipboard::new().expect("Failed to open clipboard");
-        loop {
-            thread::sleep(Duration::from_millis(200));
-            if let Ok(text) = clipboard.get_text() {
-                let mut last = last_message_for_clipboard.lock().unwrap();
-                if *last != text {
-                    log!("Clipboard changed: {}", text);
-                    let msg = Message {
-                        content: text.clone(),
-                    };
-                    if let Ok(msg_str) = serde_json::to_string(&msg) {
-                        *last = text;
-                        eprintln!("CLIPBOARD-SYNC:{}", msg_str);
+        match Clipboard::new() {
+            Ok(mut clipboard) => {
+                loop {
+                    thread::sleep(Duration::from_millis(200));
+                    if let Ok(text) = clipboard.get_text() {
+                        let mut last = last_message_for_clipboard.lock().unwrap();
+                        if *last != text {
+                            log!("Clipboard changed: {}", text);
+                            let msg = Message {
+                                content: text.clone(),
+                            };
+                            if let Ok(msg_str) = serde_json::to_string(&msg) {
+                                *last = text.clone();
+                                eprintln!("CLIPBOARD-SYNC:{}", msg_str);
+                                log!("CLIPBOARD-SYNC:{}", msg_str);
+                            }
+                        }
                     }
                 }
+            }
+            Err(e) => {
+                log!("Failed to open clipboard: {}", e);
             }
         }
     });
@@ -122,6 +128,7 @@ fn run_iosync_mode_on_mac(last_message: Arc<Mutex<String>>) -> io::Result<()> {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             if let Ok(line) = line {
+                log!("Received stdin: {}", line);
                 // Check if the line starts with "CLIPBOARD_SYNC:".
                 if line.starts_with("CLIPBOARD_SYNC:") {
                     // Extract the message after the command.
